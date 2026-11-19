@@ -12,6 +12,9 @@ Single Swift file, no dependencies, no Xcode project.
 
   Once every agent has been idle for a grace period (default 3 min), the Mac sleeps.
 - **Agent groups** you can toggle in Settings: Claude Code, Codex, and **Other** (Gemini, Aider, OpenCode, Cursor Agent, Amp, Goose, Qwen, Crush, Copilot CLI, Droid, Kiro, Cline).
+- **Auto-resume after usage limits** (tmux) — when Claude Code or Codex hits its 5-hour / session limit, AgentAwake reads the reset time from the pane (`resets 3pm`, `try again in 2 hours 13 minutes`, `try again at 3:45 PM`, …), sleeps the Mac until then, wakes it up automatically and types `continue` into the pane.
+  - Waking from sleep needs `pmset schedule wake`, which requires root. *Settings → Allow waking from sleep… (admin, once)* installs `/etc/sudoers.d/agentawake`, allowing only `pmset schedule wake` / `pmset schedule cancel wake` without a password. Without it, the Mac is kept awake (display off) until the reset instead.
+  - Change the message with `defaults write local.agentawake resumeText "please continue"`.
 - **Keep awake for** 15 min – 8 hours, or **indefinitely**.
 - The display is allowed to turn off; only system sleep is blocked (optionally keep the display on too).
 - Live agent list in the menu, grouped by tmux / Terminal (`● claude  iTerm · ttys002 — working`).
@@ -31,6 +34,8 @@ cd agent-awake
 Requires macOS 11+ and the Xcode Command Line Tools (`xcode-select --install`). tmux is looked up in `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`.
 
 ## Notes
+
+- Limit detection and auto-resume work for tmux panes only (a plain terminal window's contents can't be read or typed into).
 
 - Closing the MacBook lid still sleeps the Mac (unless in clamshell mode with power + external display) — keep the lid open.
 - Check the active sleep block with `pmset -g assertions | grep AgentAwake`.

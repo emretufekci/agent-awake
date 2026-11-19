@@ -38,6 +38,7 @@ enum AgentSource { case tmux, terminal }
 enum BusyReason {
     case screen          // "esc to interrupt" visible in the tmux pane
     case cpu(Double)     // process tree is burning CPU
+    case limited(Date)   // agent hit its usage limit; resets at this time
     case idle
 }
 
@@ -47,7 +48,12 @@ struct AgentPane {
     let name: String     // "claude", "codex", "gemini", …
     let group: AgentGroup
     let reason: BusyReason
-    var busy: Bool { if case .idle = reason { return false } else { return true } }
+    var paneId: String? = nil   // tmux pane id (%3) — needed to type "continue"
+    var limitKey: String? = nil
+    var busy: Bool {
+        switch reason { case .screen, .cpu: return true; case .idle, .limited: return false }
+    }
+    var limitReset: Date? { if case .limited(let d) = reason { return d } else { return nil } }
 }
 
 final class AgentMonitor {
@@ -74,6 +80,11 @@ final class AgentMonitor {
     /// CPU % (of one core, averaged since last scan) above which an agent counts as working.
     /// Measured: working Claude Code ≈ 10–15 %, idle at prompt ≈ 0.3–1.5 %.
     var cpuBusyThreshold = 5.0
+
+    /// Limit messages already handled (resumed), so an old message still on screen is ignored.
+    private var handledLimits = Set<String>()
+    /// First-seen parsed reset time per limit message (keeps "in 2 hours" from drifting).
+    private var limitCache: [String: Date] = [:]
 
     private struct Proc { let ppid: Int32; let tty: String; let cpuTime: Double; let pcpu: Double; let args: String }
     private var cpuSamples: [String: (cpu: Double, at: Date, pct: Double)] = [:]
@@ -134,11 +145,19 @@ final class AgentMonitor {
                     let key = "tmux:" + f[0]
                     usedKeys.insert(key)
                     let cpu = cpuPercent(key, pids)
-                    let screen = Shell.run(tmux, ["capture-pane", "-p", "-J", "-t", f[0]]).out.lowercased()
-                    let reason: BusyReason = busyMarkers.contains(where: screen.contains) ? .screen
-                        : (cpu >= cpuBusyThreshold ? .cpu(cpu) : .idle)
-                    result.append(AgentPane(source: .tmux, target: f[2], name: agent.name,
-                                            group: agent.group, reason: reason))
+                    let raw = Shell.run(tmux, ["capture-pane", "-p", "-J", "-t", f[0]]).out
+                    let screen = raw.lowercased()
+                    var reason: BusyReason = .idle
+                    var limitKey: String?
+                    if busyMarkers.contains(where: screen.contains) {
+                        reason = .screen
+                    } else if let lim = detectLimit(paneId: f[0], screen: raw) {
+                        reason = .limited(lim.reset); limitKey = lim.key
+                    } else if cpu >= cpuBusyThreshold {
+                        reason = .cpu(cpu)
+                    }
+                    result.append(AgentPane(source: .tmux, target: f[2], name: agent.name, group: agent.group,
+                                            reason: reason, paneId: f[0], limitKey: limitKey))
                 }
             }
         }
@@ -172,6 +191,31 @@ final class AgentMonitor {
         return result
     }
 
+    // MARK: Usage limits
+
+    /// Looks at the bottom of a tmux pane for a Claude/Codex usage-limit message.
+    private func detectLimit(paneId: String, screen: String) -> (key: String, reset: Date)? {
+        let lines = screen.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        for line in lines.suffix(25).reversed() where LimitParser.isLimitLine(line) {
+            let key = paneId + "|" + line
+            if handledLimits.contains(key) { return nil } // newest message already handled
+            if let d = limitCache[key] { return (key, d) }
+            guard let d = LimitParser.resetDate(in: line) else { continue }
+            limitCache[key] = d
+            return (key, d)
+        }
+        return nil
+    }
+
+    /// Types the resume message into a tmux pane and remembers the limit message as handled.
+    func resume(paneId: String, limitKey: String?, text: String) {
+        if let k = limitKey { handledLimits.insert(k) }
+        guard let tmux = tmuxPath else { return }
+        Shell.run(tmux, ["send-keys", "-t", paneId, "-l", text])
+        Thread.sleep(forTimeInterval: 0.6)
+        Shell.run(tmux, ["send-keys", "-t", paneId, "Enter"])
+    }
+
     /// Matches argv[0] (or argv[1] after an interpreter) against known agent names.
     private func agent(for args: String) -> (name: String, group: AgentGroup)? {
         let argv = args.split(separator: " ", maxSplits: 2).map { ($0 as NSString).lastPathComponent.lowercased() }
@@ -192,6 +236,75 @@ final class AgentMonitor {
         if let dash = rest.firstIndex(of: "-") { days = Double(rest[..<dash]) ?? 0; rest = rest[rest.index(after: dash)...] }
         let secs = rest.split(separator: ":").reduce(0.0) { $0 * 60 + (Double($1.replacingOccurrences(of: ",", with: ".")) ?? 0) }
         return days * 86400 + secs
+    }
+}
+
+// MARK: - Usage-limit message parsing
+
+/// Understands messages such as:
+///   Claude: "5-hour limit reached ∙ resets 3pm (Europe/Istanbul)", "You've hit your limit · resets Nov 25, 3:30pm",
+///           "Claude AI usage limit reached|1763650800"
+///   Codex:  "You've hit your usage limit … try again in 2 hours 13 minutes", "… try again at 3:45 PM"
+enum LimitParser {
+    static func isLimitLine(_ line: String) -> Bool {
+        let l = line.lowercased()
+        return (l.contains("limit") && (l.contains("reached") || l.contains("hit your") || l.contains("exceeded")))
+            && (l.contains("reset") || l.contains("try again") || l.range(of: #"\|\d{10}"#, options: .regularExpression) != nil)
+    }
+
+    static func resetDate(in line: String, now: Date = Date()) -> Date? {
+        let l = line.lowercased()
+        // 1) Unix epoch: "...limit reached|1763650800"
+        if let r = l.range(of: #"\|(\d{10})"#, options: .regularExpression),
+           let t = Double(l[r].dropFirst()) { return Date(timeIntervalSince1970: t) }
+
+        // 2) Relative: "try again in 2 hours 13 minutes" / "resets in 4h 5m"
+        if let r = l.range(of: #"(try again|resets?) in "#, options: .regularExpression) {
+            let rest = String(l[r.upperBound...])
+            var secs = 0.0
+            let re = try! NSRegularExpression(pattern: #"(\d+)\s*(days?|d\b|hours?|hrs?|h\b|minutes?|mins?|m\b|seconds?|secs?|s\b)"#)
+            for m in re.matches(in: rest, range: NSRange(rest.startIndex..., in: rest)) {
+                let n = Double(rest[Range(m.range(at: 1), in: rest)!]) ?? 0
+                let u = rest[Range(m.range(at: 2), in: rest)!]
+                secs += n * (u.hasPrefix("d") ? 86400 : u.hasPrefix("h") ? 3600 : u.hasPrefix("m") ? 60 : 1)
+            }
+            if secs > 0 { return now.addingTimeInterval(secs) }
+        }
+
+        // 3) Absolute: "resets 3pm", "resets at 15:00", "try again at nov 25th, 2026 3:45 pm"
+        guard let r = l.range(of: #"(resets?( at)?|try again at) "#, options: .regularExpression) else { return nil }
+        let rest = String(l[r.upperBound...])
+        let re = try! NSRegularExpression(pattern:
+            #"^(?:([a-z]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?,?(?: (\d{4}))?,?(?: at)? )?(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?(?:\s*\(([^)]+)\))?"#)
+        guard let m = re.firstMatch(in: rest, range: NSRange(rest.startIndex..., in: rest)) else { return nil }
+        func g(_ i: Int) -> String? { Range(m.range(at: i), in: rest).map { String(rest[$0]) } }
+        guard var hour = Int(g(4) ?? "") else { return nil }
+        let minute = Int(g(5) ?? "0") ?? 0
+        if let ap = g(6) {
+            if ap.hasPrefix("p") && hour < 12 { hour += 12 }
+            if ap.hasPrefix("a") && hour == 12 { hour = 0 }
+        }
+        guard hour < 24, minute < 60 else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        if let tzName = g(7), let tz = TimeZone(identifier: tzName.trimmingCharacters(in: .whitespaces)
+            .split(separator: "/").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: "/")) {
+            cal.timeZone = tz
+        }
+        var c = cal.dateComponents([.year, .month, .day], from: now)
+        c.hour = hour; c.minute = minute; c.second = 0
+        var explicitDay = false
+        if let mon = g(1), let day = Int(g(2) ?? "") {
+            let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+            if let mi = months.firstIndex(where: { mon.hasPrefix($0) }) {
+                c.month = mi + 1; c.day = day; explicitDay = true
+                if let y = Int(g(3) ?? "") { c.year = y }
+            }
+        }
+        guard var date = cal.date(from: c) else { return nil }
+        if date < now.addingTimeInterval(-600) {
+            date = cal.date(byAdding: explicitDay ? .year : .day, value: 1, to: date) ?? date
+        }
+        return date
     }
 }
 
@@ -276,6 +389,19 @@ enum Loc {
             "sleepingNow": "%@ — sleeping now.",
             "restored": "%@ — normal sleep restored.",
             "h": "h", "m": "m",
+            "limited": "usage limit · resets %@",
+            "limitWaitStatus": "Usage limit — resuming at %@ (%@ left)",
+            "limitWakeScheduled": "Auto-wake scheduled for %@",
+            "limitAwake": "Keeping Mac awake until then",
+            "notifyLimitSleep": "Usage limit hit. Sleeping until %@, then sending “%@”.",
+            "notifyLimitAwake": "Usage limit hit. Will send “%@” at %@.",
+            "notifyResumed": "Limit reset — resumed %d agent(s).",
+            "autoResume": "Auto-resume after usage limit (tmux)",
+            "wakeSetup": "Allow waking from sleep for limit resets… (admin, once)",
+            "wakeReady": "Waking from sleep for limit resets: enabled",
+            "wakeRemove": "Remove wake-from-sleep permission…",
+            "wakeSetupFailed": "Could not set up wake-from-sleep.",
+            "wakeSetupDone": "Wake-from-sleep enabled.",
         ],
         .tr: [
             "off": "Kapalı — Mac normal şekilde uyur",
@@ -327,6 +453,19 @@ enum Loc {
             "sleepingNow": "%@ — Mac uyutuluyor.",
             "restored": "%@ — normal uyku geri yüklendi.",
             "h": "sa", "m": "dk",
+            "limited": "kullanım limiti · %@ sıfırlanır",
+            "limitWaitStatus": "Kullanım limiti — %@ devam edilecek (%@ kaldı)",
+            "limitWakeScheduled": "Otomatik uyanma %@ için planlandı",
+            "limitAwake": "O zamana kadar Mac uyanık tutuluyor",
+            "notifyLimitSleep": "Kullanım limitine takıldı. %@ saatine kadar uyunacak, sonra “%@” gönderilecek.",
+            "notifyLimitAwake": "Kullanım limitine takıldı. %2$@ saatinde “%1$@” gönderilecek.",
+            "notifyResumed": "Limit sıfırlandı — %d ajan devam ettirildi.",
+            "autoResume": "Kullanım limitinden sonra otomatik devam et (tmux)",
+            "wakeSetup": "Limit sıfırlanınca uykudan uyanmaya izin ver… (yönetici, bir kez)",
+            "wakeReady": "Limit için uykudan uyanma: etkin",
+            "wakeRemove": "Uykudan uyanma iznini kaldır…",
+            "wakeSetupFailed": "Uykudan uyanma kurulamadı.",
+            "wakeSetupDone": "Uykudan uyanma etkinleştirildi.",
         ],
     ]
 }
@@ -344,6 +483,7 @@ enum Mode {
     case timed(until: Date)
     case indefinite
     case agents(started: Date)
+    case limitWait(until: Date, panes: [AgentPane])
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -357,6 +497,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hasAssertion = false
 
     private var lastAgents: [AgentPane] = []
+    private var scheduledWake: Date?
+    private static let sudoersPath = "/etc/sudoers.d/agentawake"
+    private var wakeHelperInstalled: Bool { FileManager.default.fileExists(atPath: Self.sudoersPath) }
     private var idleSince: Date?
 
     private let defaults = UserDefaults.standard
@@ -385,6 +528,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitor.includeTerminal = includeTerminal
         monitor.enabledGroups = Set(AgentGroup.allCases.filter(isWatched))
     }
+    private var autoResume: Bool {
+        get { defaults.object(forKey: "autoResume") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "autoResume") }
+    }
+    private var resumeText: String { defaults.string(forKey: "resumeText") ?? "continue" }
     private var maxAgentHours: Int {
         get { defaults.object(forKey: "maxAgentHours") as? Int ?? 8 }
         set { defaults.set(newValue, forKey: "maxAgentHours") }
@@ -395,6 +543,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         applyWatchSettings()
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                          object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            if case .limitWait = self.mode { self.setAssertion(true) } // stay up after the scheduled wake
+            self.tick()
+        }
         updateButton()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.tick() }
     }
@@ -426,6 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func stop() {
+        cancelScheduledWake()
         mode = .off
         setAssertion(false)
         updateButton()
@@ -462,12 +617,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 idleSince = Date()
             }
             if let s = idleSince, Date().timeIntervalSince(s) >= Double(graceMinutes * 60) {
-                finish(message: lastAgents.isEmpty ? L("noAgentsRunning") : L("allIdle"), sleep: sleepWhenDone)
+                let limited = lastAgents.filter { $0.limitReset != nil && $0.paneId != nil }
+                if autoResume, let earliest = limited.compactMap(\.limitReset).min(),
+                   earliest.timeIntervalSinceNow < 24 * 3600 {
+                    beginLimitWait(reset: earliest,
+                                   panes: limited.filter { $0.limitReset! <= earliest.addingTimeInterval(120) })
+                } else {
+                    finish(message: lastAgents.isEmpty ? L("noAgentsRunning") : L("allIdle"), sleep: sleepWhenDone)
+                }
             } else if Date().timeIntervalSince(started) >= Double(maxAgentHours * 3600) {
                 finish(message: L("safetyReached", maxAgentHours), sleep: sleepWhenDone)
             }
+        case .limitWait(let until, let panes):
+            if Date() >= until { resumeAfterLimit(panes) }
         }
         updateButton()
+    }
+
+    // MARK: Usage limits
+
+    /// Agents hit their usage limit: sleep (with a scheduled wake) or stay awake until the reset.
+    private func beginLimitWait(reset: Date, panes: [AgentPane]) {
+        let resumeAt = max(reset, Date()).addingTimeInterval(60) // small buffer after the reset
+        mode = .limitWait(until: resumeAt, panes: panes)
+        let f = DateFormatter(); f.timeStyle = .short; f.locale = Loc.locale
+        let when = f.string(from: resumeAt)
+        let userIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
+                                                              eventType: CGEventType(rawValue: ~0)!)
+        if sleepWhenDone, userIdle > 60, resumeAt.timeIntervalSinceNow > 5 * 60,
+           scheduleWake(at: resumeAt.addingTimeInterval(-30)) {
+            setAssertion(false)
+            notify("AgentAwake", L("notifyLimitSleep", when, resumeText))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                if case .limitWait = self.mode { Shell.run("/usr/bin/pmset", ["sleepnow"]) }
+            }
+        } else {
+            setAssertion(true) // no wake permission (or user active): just stay awake, display may sleep
+            notify("AgentAwake", L("notifyLimitAwake", resumeText, when))
+        }
+        updateButton()
+    }
+
+    private func resumeAfterLimit(_ panes: [AgentPane]) {
+        cancelScheduledWake()
+        setAssertion(true)
+        let text = resumeText
+        DispatchQueue.global().async {
+            for p in panes { if let id = p.paneId { self.monitor.resume(paneId: id, limitKey: p.limitKey, text: text) } }
+        }
+        notify("AgentAwake", L("notifyResumed", panes.count))
+        mode = .agents(started: Date())
+        idleSince = nil
+    }
+
+    private static let pmsetDate: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "MM/dd/yy HH:mm:ss"; return f
+    }()
+
+    /// `pmset schedule wake` needs root; allowed password-less via /etc/sudoers.d/agentawake.
+    private func scheduleWake(at date: Date) -> Bool {
+        guard wakeHelperInstalled else { return false }
+        cancelScheduledWake()
+        let ok = Shell.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "schedule", "wake", Self.pmsetDate.string(from: date)]).status == 0
+        if ok { scheduledWake = date }
+        return ok
+    }
+
+    private func cancelScheduledWake() {
+        guard let d = scheduledWake else { return }
+        Shell.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "schedule", "cancel", "wake", Self.pmsetDate.string(from: d)])
+        scheduledWake = nil
+    }
+
+    private func runAsAdmin(_ shell: String) -> Bool {
+        let esc = shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        return Shell.run("/usr/bin/osascript", ["-e", "do shell script \"\(esc)\" with administrator privileges"]).status == 0
+    }
+
+    @objc private func installWakeHelper() {
+        let user = NSUserName()
+        guard user.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil else { return }
+        let rule = "\(user) ALL=(root) NOPASSWD: /usr/bin/pmset schedule wake *, /usr/bin/pmset schedule cancel wake *"
+        let cmd = "T=$(/usr/bin/mktemp) && /usr/bin/printf '%s\\n' '\(rule)' > $T && /usr/sbin/visudo -cf $T && " +
+                  "/usr/bin/install -m 0440 -o root -g wheel $T \(Self.sudoersPath); R=$?; /bin/rm -f $T; exit $R"
+        DispatchQueue.global().async {
+            let ok = self.runAsAdmin(cmd)
+            DispatchQueue.main.async { self.notify("AgentAwake", ok ? L("wakeSetupDone") : L("wakeSetupFailed")) }
+        }
+    }
+
+    @objc private func removeWakeHelper() {
+        DispatchQueue.global().async { _ = self.runAsAdmin("/bin/rm -f \(Self.sudoersPath)") }
     }
 
     // MARK: UI
@@ -483,6 +723,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             symbol = "cup.and.saucer.fill"; title = " ∞"
         case .timed(let until):
             symbol = "cup.and.saucer.fill"; title = " " + shortDuration(until.timeIntervalSinceNow)
+        case .limitWait(let until, _):
+            symbol = "hourglass"; title = " ⏸" + shortDuration(until.timeIntervalSinceNow)
         case .agents:
             symbol = "terminal.fill"
             let busy = lastAgents.filter(\.busy).count
@@ -506,6 +748,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func agentReason(_ a: AgentPane) -> String {
         switch a.reason {
         case .idle: return L("idle")
+        case .limited(let d):
+            let f = DateFormatter(); f.timeStyle = .short; f.locale = Loc.locale
+            if !Calendar.current.isDateInToday(d) { f.dateStyle = .short }
+            return L("limited", f.string(from: d))
         case .screen: return L("working")
         case .cpu(let pct): return L("working") + " · " + L("cpu", String(format: "%.0f", pct))
         }
@@ -522,6 +768,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let status: String
         switch mode {
         case .off: status = L("off")
+        case .limitWait(let until, _):
+            let f = DateFormatter(); f.timeStyle = .short; f.locale = Loc.locale
+            status = L("limitWaitStatus", f.string(from: until), shortDuration(until.timeIntervalSinceNow))
         case .indefinite: status = L("indefinite")
         case .timed(let until):
             let f = DateFormatter(); f.timeStyle = .short; f.locale = Loc.locale
@@ -535,6 +784,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else { status = L("waiting") }
         }
         menu.addItem(disabled(status))
+        if case .limitWait = mode, let w = scheduledWake {
+            let f = DateFormatter(); f.timeStyle = .short; f.locale = Loc.locale
+            menu.addItem(disabled(L("limitWakeScheduled", f.string(from: w))))
+        }
         menu.addItem(disabled(hasAssertion
             ? (keepDisplayOn ? L("displayAwake") : L("systemAwake"))
             : L("noBlock")))
@@ -551,7 +804,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard !list.isEmpty else { continue }
                 menu.addItem(disabled(header))
                 for a in list {
-                    menu.addItem(disabled("  \(a.busy ? "●" : "○")  \(a.name)  \(a.target) — \(agentReason(a))"))
+                    menu.addItem(disabled("  \(a.busy ? "●" : (a.limitReset != nil ? "⏸" : "○"))  \(a.name)  \(a.target) — \(agentReason(a))"))
                 }
             }
         }
@@ -586,6 +839,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let i = toggle("  " + L(key), isWatched(g), #selector(toggleGroup(_:))); i.tag = idx; s.addItem(i)
         }
         s.addItem(toggle(L("includeTerminal"), includeTerminal, #selector(toggleTerminal)))
+        s.addItem(.separator())
+        s.addItem(toggle(L("autoResume"), autoResume, #selector(toggleAutoResume)))
+        if wakeHelperInstalled {
+            let ready = disabled("  ✓ " + L("wakeReady")); s.addItem(ready)
+            s.addItem(item("  " + L("wakeRemove"), #selector(removeWakeHelper)))
+        } else {
+            s.addItem(item("  " + L("wakeSetup"), #selector(installWakeHelper)))
+        }
         s.addItem(.separator())
         s.addItem(toggle(L("keepDisplay"), keepDisplayOn, #selector(toggleDisplay)))
         s.addItem(toggle(L("sleepAgents"), sleepWhenDone, #selector(toggleSleepWhenDone)))
@@ -652,6 +913,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Loc.choice = Lang.allCases[s.tag]
         updateButton() // menu text is rebuilt on next open
     }
+    @objc private func toggleAutoResume() { autoResume.toggle() }
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func notify(_ title: String, _ body: String) {
