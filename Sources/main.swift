@@ -1,5 +1,6 @@
 // AgentAwake — menu bar app that keeps your Mac awake for a fixed time,
-// indefinitely, or until the Claude Code / Codex agents running in tmux finish,
+// indefinitely, or until the AI coding agents (Claude Code, Codex, Gemini,
+// Aider, OpenCode, …) running in tmux or directly in a terminal finish,
 // then optionally puts the Mac to sleep.
 
 import Cocoa
@@ -26,90 +27,171 @@ enum Shell {
     }
 }
 
-// MARK: - tmux agent detection
+// MARK: - Agent detection (tmux + plain terminals)
 
-struct AgentPane {
-    let target: String   // e.g. "main:1.0"
-    let kind: String     // "claude" / "codex"
-    let busy: Bool
-    let reason: String
+enum AgentGroup: String, CaseIterable {
+    case claude, codex, other
 }
 
-final class TmuxMonitor {
+enum AgentSource { case tmux, terminal }
+
+enum BusyReason {
+    case screen          // "esc to interrupt" visible in the tmux pane
+    case cpu(Double)     // process tree is burning CPU
+    case idle
+}
+
+struct AgentPane {
+    let source: AgentSource
+    let target: String   // "main:1.0" for tmux, "Ghostty · ttys003" for terminals
+    let name: String     // "claude", "codex", "gemini", …
+    let group: AgentGroup
+    let reason: BusyReason
+    var busy: Bool { if case .idle = reason { return false } else { return true } }
+}
+
+final class AgentMonitor {
     let tmuxPath: String? = [
         "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux",
         "/run/current-system/sw/bin/tmux",
     ].first { FileManager.default.isExecutableFile(atPath: $0) }
 
+    /// Executable names we recognise as coding agents.
+    static let knownAgents: [(name: String, group: AgentGroup)] = [
+        ("claude", .claude), ("codex", .codex),
+        ("gemini", .other), ("aider", .other), ("opencode", .other), ("cursor-agent", .other),
+        ("amp", .other), ("goose", .other), ("qwen", .other), ("crush", .other),
+        ("copilot", .other), ("droid", .other), ("kiro-cli", .other), ("cline", .other),
+    ]
+    /// Interpreters whose first argument is the actual tool (`node …/claude`).
+    private static let interpreters = ["node", "bun", "deno", "python", "uv", "npx"]
+
+    var enabledGroups: Set<AgentGroup> = Set(AgentGroup.allCases)
+    var includeTerminal = true
+
     /// Strings agents print on screen while a turn is in progress.
     private let busyMarkers = ["esc to interrupt", "ctrl+c to interrupt", "esc to cancel"]
-    /// Summed CPU % of the pane's process tree above which we treat it as busy
-    /// (catches long-running tool calls such as builds/tests).
-    var cpuBusyThreshold = 15.0
+    /// CPU % (of one core, averaged since last scan) above which an agent counts as working.
+    /// Measured: working Claude Code ≈ 10–15 %, idle at prompt ≈ 0.3–1.5 %.
+    var cpuBusyThreshold = 5.0
 
-    private let agentRegex = try! NSRegularExpression(
-        pattern: #"(^|/)(claude|codex)([-_.][^/]*)?$"#, options: [.caseInsensitive])
+    private struct Proc { let ppid: Int32; let tty: String; let cpuTime: Double; let pcpu: Double; let args: String }
+    private var cpuSamples: [String: (cpu: Double, at: Date, pct: Double)] = [:]
 
     func scan() -> [AgentPane] {
-        guard let tmux = tmuxPath else { return [] }
-        let panes = Shell.run(tmux, ["list-panes", "-a", "-F",
-            "#{pane_id}|#{pane_pid}|#{session_name}:#{window_index}.#{pane_index}"])
-        guard panes.status == 0 else { return [] }
-
-        // Build process table once.
+        var procs: [Int32: Proc] = [:]
         var children: [Int32: [Int32]] = [:]
-        var procs: [Int32: (cpu: Double, args: String)] = [:]
-        for line in Shell.run("/bin/ps", ["-axo", "pid=,ppid=,pcpu=,args="]).out.split(separator: "\n") {
-            let f = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-            guard f.count == 4, let pid = Int32(f[0]), let ppid = Int32(f[1]) else { continue }
-            let cpu = Double(f[2].replacingOccurrences(of: ",", with: ".")) ?? 0
+        for line in Shell.run("/bin/ps", ["-axo", "pid=,ppid=,tty=,time=,pcpu=,args="]).out.split(separator: "\n") {
+            let f = line.split(separator: " ", maxSplits: 5, omittingEmptySubsequences: true)
+            guard f.count == 6, let pid = Int32(f[0]), let ppid = Int32(f[1]) else { continue }
+            procs[pid] = Proc(ppid: ppid, tty: String(f[2]), cpuTime: Self.parseTime(String(f[3])),
+                              pcpu: Double(f[4].replacingOccurrences(of: ",", with: ".")) ?? 0,
+                              args: String(f[5]))
             children[ppid, default: []].append(pid)
-            procs[pid] = (cpu, String(f[3]))
+        }
+
+        func subtree(_ root: Int32) -> [Int32] {
+            var out: [Int32] = [], queue = [root], seen = Set<Int32>()
+            while !queue.isEmpty {
+                let pid = queue.removeFirst()
+                guard seen.insert(pid).inserted else { continue }
+                out.append(pid)
+                queue.append(contentsOf: children[pid] ?? [])
+            }
+            return out // breadth-first: top-most processes first
+        }
+        func cpuPercent(_ key: String, _ pids: [Int32]) -> Double {
+            let total = pids.reduce(0) { $0 + (procs[$1]?.cpuTime ?? 0) }
+            let now = Date()
+            let pct: Double
+            if let prev = cpuSamples[key] {
+                let dt = now.timeIntervalSince(prev.at)
+                if dt < 3 { return prev.pct } // scanned again right away (menu open)
+                pct = max(0, (total - prev.cpu) / dt * 100)
+            } else {
+                pct = pids.reduce(0) { $0 + (procs[$1]?.pcpu ?? 0) } // first sight: ps estimate
+            }
+            cpuSamples[key] = (total, now, pct)
+            return pct
         }
 
         var result: [AgentPane] = []
-        for line in panes.out.split(separator: "\n") {
-            let f = line.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
-            guard f.count == 3, let root = Int32(f[1]) else { continue }
+        var usedKeys = Set<String>()
+        var tmuxPids = Set<Int32>()
 
-            // Walk subtree: find agent + total CPU.
-            var kind: String?
-            var cpu = 0.0
-            var stack = [root]
-            var seen = Set<Int32>()
-            while let pid = stack.popLast(), seen.insert(pid).inserted {
-                if let p = procs[pid] {
-                    cpu += p.cpu
-                    if kind == nil, let k = agentKind(p.args) { kind = k }
+        // 1) tmux panes
+        if let tmux = tmuxPath {
+            let panes = Shell.run(tmux, ["list-panes", "-a", "-F",
+                "#{pane_id}|#{pane_pid}|#{session_name}:#{window_index}.#{pane_index}"])
+            if panes.status == 0 {
+                for line in panes.out.split(separator: "\n") {
+                    let f = line.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+                    guard f.count == 3, let root = Int32(f[1]) else { continue }
+                    let pids = subtree(root)
+                    tmuxPids.formUnion(pids)
+                    guard let agent = pids.lazy.compactMap({ procs[$0].flatMap { self.agent(for: $0.args) } }).first,
+                          enabledGroups.contains(agent.group) else { continue }
+                    let key = "tmux:" + f[0]
+                    usedKeys.insert(key)
+                    let cpu = cpuPercent(key, pids)
+                    let screen = Shell.run(tmux, ["capture-pane", "-p", "-J", "-t", f[0]]).out.lowercased()
+                    let reason: BusyReason = busyMarkers.contains(where: screen.contains) ? .screen
+                        : (cpu >= cpuBusyThreshold ? .cpu(cpu) : .idle)
+                    result.append(AgentPane(source: .tmux, target: f[2], name: agent.name,
+                                            group: agent.group, reason: reason))
                 }
-                stack.append(contentsOf: children[pid] ?? [])
-            }
-            guard let agent = kind else { continue }
-
-            let screen = Shell.run(tmux, ["capture-pane", "-p", "-J", "-t", f[0]]).out.lowercased()
-            if busyMarkers.contains(where: screen.contains) {
-                result.append(AgentPane(target: f[2], kind: agent, busy: true, reason: "working"))
-            } else if cpu >= cpuBusyThreshold {
-                result.append(AgentPane(target: f[2], kind: agent, busy: true,
-                                        reason: String(format: "cpu %.0f%%", cpu)))
-            } else {
-                result.append(AgentPane(target: f[2], kind: agent, busy: false, reason: "idle"))
             }
         }
+
+        // 2) agents started directly in a terminal window (Terminal, iTerm2, Ghostty, VS Code, …)
+        if includeTerminal {
+            for (pid, p) in procs.sorted(by: { $0.key < $1.key }) {
+                guard p.tty != "??", !p.tty.isEmpty, !tmuxPids.contains(pid),
+                      !p.args.contains("--bg-"), !p.args.contains(" daemon"),
+                      let agent = agent(for: p.args), enabledGroups.contains(agent.group) else { continue }
+                // Skip sub-agents: only report the top-most agent process.
+                var anc = p.ppid, nested = false, app: String?
+                while anc > 1, let a = procs[anc] {
+                    if self.agent(for: a.args) != nil { nested = true; break }
+                    if app == nil, let r = a.args.range(of: ".app/") {
+                        app = (String(a.args[..<r.lowerBound]) as NSString).lastPathComponent
+                    }
+                    anc = a.ppid
+                }
+                if nested { continue }
+                let key = "pid:\(pid)"
+                usedKeys.insert(key)
+                let cpu = cpuPercent(key, subtree(pid))
+                let target = (app.map { $0 + " · " } ?? "") + p.tty
+                result.append(AgentPane(source: .terminal, target: target, name: agent.name,
+                                        group: agent.group, reason: cpu >= cpuBusyThreshold ? .cpu(cpu) : .idle))
+            }
+        }
+
+        cpuSamples = cpuSamples.filter { usedKeys.contains($0.key) }
         return result
     }
 
-    /// Looks at argv[0] and argv[1] (for `node /path/to/claude`) basenames.
-    private func agentKind(_ args: String) -> String? {
-        let parts = args.split(separator: " ").prefix(2)
-        for part in parts {
-            let s = String(part)
-            let r = NSRange(s.startIndex..., in: s)
-            if agentRegex.firstMatch(in: s, range: r) != nil {
-                return s.lowercased().contains("codex") ? "codex" : "claude"
+    /// Matches argv[0] (or argv[1] after an interpreter) against known agent names.
+    private func agent(for args: String) -> (name: String, group: AgentGroup)? {
+        let argv = args.split(separator: " ", maxSplits: 2).map { ($0 as NSString).lastPathComponent.lowercased() }
+        guard let first = argv.first, !args.contains("language-server") else { return nil }
+        var candidates = [first]
+        if argv.count > 1, Self.interpreters.contains(where: { first.hasPrefix($0) }) { candidates.append(argv[1]) }
+        for c in candidates {
+            for k in Self.knownAgents where c == k.name || c.hasPrefix(k.name + "-") || c.hasPrefix(k.name + ".") {
+                return k
             }
         }
         return nil
+    }
+
+    /// Parses ps `time` output: "MM:SS.ss" or "HH:MM:SS.ss" (and "D-HH:MM:SS").
+    private static func parseTime(_ s: String) -> Double {
+        var days = 0.0, rest = Substring(s)
+        if let dash = rest.firstIndex(of: "-") { days = Double(rest[..<dash]) ?? 0; rest = rest[rest.index(after: dash)...] }
+        let secs = rest.split(separator: ":").reduce(0.0) { $0 * 60 + (Double($1.replacingOccurrences(of: ",", with: ".")) ?? 0) }
+        return days * 86400 + secs
     }
 }
 
@@ -156,12 +238,14 @@ enum Loc {
             "systemAwake": "System kept awake (display may sleep)",
             "noBlock": "No sleep block active",
             "noTmux": "tmux not found",
-            "noAgents": "No Claude/Codex agents in tmux",
-            "agentsHeader": "tmux agents:",
+            "noAgents": "No coding agents running",
+            "tmuxHeader": "tmux:",
+            "terminalHeader": "Terminal:",
+            "noTmuxShort": "tmux not installed — only terminals are watched",
             "working": "working",
             "idle": "idle",
             "cpu": "CPU %@%%",
-            "startAgents": "Wait for tmux agents, then sleep",
+            "startAgents": "Wait for agents, then sleep",
             "keepFor": "Keep awake for",
             "minutes": "%d minutes",
             "hour1": "1 hour",
@@ -180,8 +264,14 @@ enum Loc {
             "lidNote": "Note: closing the lid still sleeps the Mac",
             "quit": "Quit AgentAwake",
             "timerFinished": "Timer finished",
-            "noAgentsRunning": "No tmux agents running",
-            "allIdle": "All tmux agents are idle",
+            "noAgentsRunning": "No agents running",
+            "allIdle": "All agents are idle",
+            "watchHeader": "Watch these agents:",
+            "groupClaude": "Claude Code",
+            "groupCodex": "Codex",
+            "groupOther": "Other (Gemini, Aider, OpenCode, Cursor, Amp…)",
+            "includeTerminal": "Also watch agents outside tmux (Terminal, iTerm, …)",
+            "nothingToWatch": "Nothing to watch: enable tmux or terminal agents",
             "safetyReached": "Reached %dh safety limit",
             "sleepingNow": "%@ — sleeping now.",
             "restored": "%@ — normal sleep restored.",
@@ -199,12 +289,14 @@ enum Loc {
             "systemAwake": "Sistem uyanık tutuluyor (ekran kapanabilir)",
             "noBlock": "Uyku engeli aktif değil",
             "noTmux": "tmux bulunamadı",
-            "noAgents": "tmux'ta Claude/Codex ajanı yok",
-            "agentsHeader": "tmux ajanları:",
+            "noAgents": "Çalışan kodlama ajanı yok",
+            "tmuxHeader": "tmux:",
+            "terminalHeader": "Terminal:",
+            "noTmuxShort": "tmux kurulu değil — sadece terminaller izleniyor",
             "working": "çalışıyor",
             "idle": "boşta",
             "cpu": "CPU %%%@",
-            "startAgents": "tmux ajanlarını bekle, sonra uyu",
+            "startAgents": "Ajanları bekle, sonra uyu",
             "keepFor": "Şu süre uyanık tut",
             "minutes": "%d dakika",
             "hour1": "1 saat",
@@ -223,8 +315,14 @@ enum Loc {
             "lidNote": "Not: Kapağı kapatmak Mac'i yine uyutur",
             "quit": "AgentAwake'ten çık",
             "timerFinished": "Süre doldu",
-            "noAgentsRunning": "Çalışan tmux ajanı yok",
-            "allIdle": "Tüm tmux ajanları boşta",
+            "noAgentsRunning": "Çalışan ajan yok",
+            "allIdle": "Tüm ajanlar boşta",
+            "watchHeader": "İzlenecek ajanlar:",
+            "groupClaude": "Claude Code",
+            "groupCodex": "Codex",
+            "groupOther": "Diğer (Gemini, Aider, OpenCode, Cursor, Amp…)",
+            "includeTerminal": "tmux dışındaki ajanları da izle (Terminal, iTerm, …)",
+            "nothingToWatch": "İzlenecek bir şey yok: tmux veya terminal ajanlarını aç",
             "safetyReached": "%d saatlik güvenlik sınırına ulaşıldı",
             "sleepingNow": "%@ — Mac uyutuluyor.",
             "restored": "%@ — normal uyku geri yüklendi.",
@@ -251,7 +349,7 @@ enum Mode {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
-    private let monitor = TmuxMonitor()
+    private let monitor = AgentMonitor()
     private var timer: Timer?
 
     private var mode: Mode = .off
@@ -278,6 +376,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         get { defaults.object(forKey: "graceMinutes") as? Int ?? 3 }
         set { defaults.set(newValue, forKey: "graceMinutes") }
     }
+    private var includeTerminal: Bool {
+        get { defaults.object(forKey: "includeTerminal") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "includeTerminal"); applyWatchSettings() }
+    }
+    private func isWatched(_ g: AgentGroup) -> Bool { defaults.object(forKey: "watch." + g.rawValue) as? Bool ?? true }
+    private func applyWatchSettings() {
+        monitor.includeTerminal = includeTerminal
+        monitor.enabledGroups = Set(AgentGroup.allCases.filter(isWatched))
+    }
     private var maxAgentHours: Int {
         get { defaults.object(forKey: "maxAgentHours") as? Int ?? 8 }
         set { defaults.set(newValue, forKey: "maxAgentHours") }
@@ -287,6 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         menu.delegate = self
         statusItem.menu = menu
+        applyWatchSettings()
         updateButton()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.tick() }
     }
@@ -396,11 +504,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func agentReason(_ a: AgentPane) -> String {
-        if !a.busy { return L("idle") }
-        if a.reason.hasPrefix("cpu ") {
-            return L("cpu", String(a.reason.dropFirst(4).dropLast()))
+        switch a.reason {
+        case .idle: return L("idle")
+        case .screen: return L("working")
+        case .cpu(let pct): return L("working") + " · " + L("cpu", String(format: "%.0f", pct))
         }
-        return L("working")
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -431,18 +539,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ? (keepDisplayOn ? L("displayAwake") : L("systemAwake"))
             : L("noBlock")))
 
-        // Agents
+        // Agents — tmux and plain terminals side by side
         menu.addItem(.separator())
-        if monitor.tmuxPath == nil {
+        if monitor.tmuxPath == nil && !includeTerminal {
             menu.addItem(disabled(L("noTmux")))
         } else if lastAgents.isEmpty {
             menu.addItem(disabled(L("noAgents")))
         } else {
-            menu.addItem(disabled(L("agentsHeader")))
-            for a in lastAgents {
-                menu.addItem(disabled("  \(a.busy ? "●" : "○")  \(a.kind)  \(a.target) — \(agentReason(a))"))
+            for (source, header) in [(AgentSource.tmux, L("tmuxHeader")), (.terminal, L("terminalHeader"))] {
+                let list = lastAgents.filter { $0.source == source }
+                guard !list.isEmpty else { continue }
+                menu.addItem(disabled(header))
+                for a in list {
+                    menu.addItem(disabled("  \(a.busy ? "●" : "○")  \(a.name)  \(a.target) — \(agentReason(a))"))
+                }
             }
         }
+        if monitor.tmuxPath == nil && includeTerminal { menu.addItem(disabled(L("noTmuxShort"))) }
 
         // Actions
         menu.addItem(.separator())
@@ -467,6 +580,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let settings = NSMenuItem(title: L("settings"), action: nil, keyEquivalent: "")
         settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
         let s = NSMenu()
+        s.addItem(disabled(L("watchHeader")))
+        for (idx, g) in AgentGroup.allCases.enumerated() {
+            let key = g == .claude ? "groupClaude" : (g == .codex ? "groupCodex" : "groupOther")
+            let i = toggle("  " + L(key), isWatched(g), #selector(toggleGroup(_:))); i.tag = idx; s.addItem(i)
+        }
+        s.addItem(toggle(L("includeTerminal"), includeTerminal, #selector(toggleTerminal)))
+        s.addItem(.separator())
         s.addItem(toggle(L("keepDisplay"), keepDisplayOn, #selector(toggleDisplay)))
         s.addItem(toggle(L("sleepAgents"), sleepWhenDone, #selector(toggleSleepWhenDone)))
         s.addItem(toggle(L("sleepTimer"), sleepAfterTimer, #selector(toggleSleepAfterTimer)))
@@ -511,7 +631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Actions
 
     @objc private func startAgents() {
-        if monitor.tmuxPath == nil { notify("AgentAwake", L("noTmux")); return }
+        if monitor.tmuxPath == nil && !includeTerminal { notify("AgentAwake", L("nothingToWatch")); return }
         start(.agents(started: Date()))
     }
     @objc private func startTimed(_ s: NSMenuItem) { start(.timed(until: Date().addingTimeInterval(Double(s.tag * 60)))) }
@@ -520,6 +640,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleDisplay() { keepDisplayOn.toggle(); if hasAssertion { setAssertion(true) } }
     @objc private func toggleSleepWhenDone() { sleepWhenDone.toggle() }
     @objc private func toggleSleepAfterTimer() { sleepAfterTimer.toggle() }
+    @objc private func toggleGroup(_ s: NSMenuItem) {
+        let g = AgentGroup.allCases[s.tag]
+        defaults.set(!isWatched(g), forKey: "watch." + g.rawValue)
+        applyWatchSettings()
+    }
+    @objc private func toggleTerminal() { includeTerminal.toggle() }
     @objc private func setGrace(_ s: NSMenuItem) { graceMinutes = s.tag }
     @objc private func setMax(_ s: NSMenuItem) { maxAgentHours = s.tag }
     @objc private func setLanguage(_ s: NSMenuItem) {
