@@ -9,7 +9,9 @@ Plain Swift, no dependencies, no Xcode project.
 **Homebrew**
 
 ```bash
-brew install --cask emretufekci/tap/agent-awake
+brew tap emretufekci/tap
+brew trust emretufekci/tap   # Homebrew 7+ asks you to trust third-party taps
+brew install --cask agent-awake
 ```
 
 **From source** (needs Xcode Command Line Tools: `xcode-select --install`)
